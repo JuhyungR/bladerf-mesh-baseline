@@ -1,0 +1,659 @@
+#!/usr/bin/env python3
+"""Single-attempt manifest-bound bladeRF runtime."""
+
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import signal
+import shutil
+import subprocess
+import sys
+import time
+
+INVENTORY = "g148-immutable-runtime-v1"
+NO_START = "NO_START"
+RESERVED = "EXECUTION_RESERVED"
+ROOT = os.environ.get("BLADERF_ROOT")
+TEST_MODE = os.environ.get("BLADERF_TEST_MODE", "0")
+JETSON_READY_STEPS = 50
+BASE_ASSOCIATION_READY_STEPS = 1200
+
+
+def fail(message, code=78):
+    sys.stderr.write(message + "\n")
+    raise SystemExit(code)
+
+
+def parse_args():
+    if len(sys.argv) != 3:
+        fail("usage: bladerf-link-node {status|run} <base|jetson> | <base|jetson> <env-file>", 2)
+    command, value = sys.argv[1:]
+    if command in ("status", "run"):
+        node, config_arg = value, None
+    elif command in ("base", "jetson"):
+        node, command, config_arg = command, "unit-run", value
+    else:
+        fail("unsupported command", 2)
+    if node not in ("base", "jetson"):
+        fail("unsupported node", 2)
+    return command, node, config_arg
+
+
+def rooted(path):
+    return (ROOT or "") + path
+
+
+def validate_disposable_test_root():
+    if ROOT in (None, "", "/") or not os.path.isabs(ROOT) or os.path.islink(ROOT) or not os.path.isdir(ROOT):
+        fail("test mode requires an explicit non-root BLADERF_ROOT")
+    if os.path.realpath(ROOT) != os.path.normpath(ROOT):
+        fail("test root must be canonical")
+    details = os.stat(ROOT)
+    if os.geteuid() == 0 or details.st_uid != os.geteuid():
+        fail("test root must be owned by a non-root operator")
+    return os.path.realpath(ROOT)
+
+
+def require_contained_path(path, root, must_exist):
+    if not os.path.isabs(path) or os.path.islink(path):
+        fail("test output path is invalid")
+    candidate = os.path.realpath(path if must_exist else os.path.dirname(path))
+    if os.path.commonpath([root, candidate]) != root:
+        fail("test output escapes BLADERF_ROOT")
+    if must_exist and not os.path.isdir(path):
+        fail("test output directory is missing")
+
+
+def installed_context(command):
+    return ROOT is not None or command == "unit-run" or os.path.lexists("/etc/bladerf-link")
+
+
+def read_authority(command):
+    if not installed_context(command):
+        return NO_START
+    path = rooted("/etc/bladerf-link/start-authority")
+    if os.path.islink(path) or not os.path.isfile(path):
+        fail("installed authority is invalid")
+    with open(path, "r") as handle:
+        value = handle.read()
+    if value not in (NO_START + "\n", RESERVED + "\n"):
+        fail("installed authority token is invalid")
+    return value.rstrip("\n")
+
+
+def status(node, authority):
+    active, sub, main_pid, n_restarts = "inactive", "dead", "0", "0"
+    wlan0, hwsim = "0", "absent"
+    if ROOT is None and os.path.lexists("/etc/bladerf-link"):
+        service = "bladerf-link-%s.service" % node
+        observed = subprocess.check_output([
+            "systemctl", "show", service, "-p", "ActiveState", "-p", "SubState",
+            "-p", "MainPID", "-p", "NRestarts",
+        ]).decode("ascii").splitlines()
+        values = dict(line.split("=", 1) for line in observed if "=" in line)
+        if set(values) != {"ActiveState", "SubState", "MainPID", "NRestarts"}:
+            fail("systemd status is not canonical")
+        active, sub = values["ActiveState"], values["SubState"]
+        main_pid, n_restarts = values["MainPID"], values["NRestarts"]
+        wlan0 = "1" if subprocess.call(["ip", "link", "show", "dev", "wlan0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0 else "0"
+        hwsim = "present" if os.path.isdir("/sys/module/mac80211_hwsim") else "absent"
+    fields = (
+        ("inventory_version", INVENTORY), ("node", node),
+        ("runtime_state", "C_BYTES_VALID"), ("start_authority", authority),
+        ("active", active), ("sub", sub), ("main_pid", main_pid),
+        ("n_restarts", n_restarts), ("wlan0", wlan0), ("hwsim", hwsim),
+    )
+    sys.stdout.write("".join("%s=%s\n" % item for item in fields))
+
+
+def stable_management_snapshot(raw):
+    try:
+        observed = json.loads(raw)
+    except (TypeError, ValueError):
+        fail("Base management snapshot is not valid JSON", 1)
+    if not isinstance(observed, list) or len(observed) != 1 or not isinstance(observed[0], dict):
+        fail("Base management snapshot shape is invalid", 1)
+    interface = observed[0]
+    if not isinstance(interface.get("ifname"), str) or not interface["ifname"]:
+        fail("Base management interface name is invalid", 1)
+    stable = {
+        "ifname": interface["ifname"],
+        "address": interface.get("address"),
+        "operstate": interface.get("operstate"),
+        "addr_info": [],
+    }
+    for address in interface.get("addr_info", []):
+        if not isinstance(address, dict):
+            fail("Base management address shape is invalid", 1)
+        stable["addr_info"].append({key: address.get(key) for key in (
+            "family", "local", "prefixlen", "scope", "label",
+        )})
+    stable["addr_info"].sort(key=lambda item: json.dumps(item, sort_keys=True))
+    return json.dumps(stable, sort_keys=True, separators=(",", ":"))
+
+
+def validate_fixed_profile(profile, node):
+    rf = profile["rf"]
+    if (rf.get("frequency_mhz"), rf.get("bandwidth_mhz"), rf.get("streams")) != (2412, 20, 1):
+        fail("fixed RF profile differs", 2)
+    if node == "jetson" and rf.get("dsa_gain_db") not in (-15, -10, 0):
+        fail("fixed Jetson gain differs", 2)
+
+
+def read_generated_config(node, config_arg):
+    config_path = rooted(config_arg or "/etc/bladerf-link/%s.env" % node)
+    module_dir = rooted("/usr/local/lib/bladerf-link")
+    manifest_path = rooted("/usr/local/share/bladerf-mesh/manifest/baseline-manifest.json")
+    for path in (config_path, os.path.join(module_dir, "baseline_manifest.py"), manifest_path):
+        if os.path.islink(path) or not os.path.isfile(path):
+            fail("installed generated config boundary is invalid")
+    pairs = {}
+    with open(config_path, "r") as handle:
+        for raw in handle:
+            key, separator, value = raw.rstrip("\n").partition("=")
+            if not separator or key in pairs:
+                fail("generated config is malformed")
+            pairs[key] = value
+    required = {
+        "BLADERF_GENERATOR_NAME", "BLADERF_GENERATOR_VERSION", "BLADERF_MANIFEST_SHA256",
+        "BLADERF_NETWORK_B64", "BLADERF_NODE", "BLADERF_RF_B64", "BLADERF_SERIAL_B64",
+    }
+    if set(pairs) != required or pairs["BLADERF_NODE"] != node:
+        fail("generated config keys or node differ")
+    if pairs["BLADERF_GENERATOR_NAME"] != "baseline_manifest.render_generated_config" or pairs["BLADERF_GENERATOR_VERSION"] != "1":
+        fail("generated config generator differs")
+    sys.path.insert(0, module_dir)
+    from baseline_manifest import canonical_bytes, manifest_sha256, validate_local_profile, validate_manifest
+
+    def decode(key):
+        try:
+            return json.loads(base64.b64decode(pairs[key].encode("ascii"), validate=True).decode("utf-8"))
+        except Exception:
+            fail("generated config base64 is invalid")
+
+    profile = {"node": node, "network": decode("BLADERF_NETWORK_B64"),
+               "rf": decode("BLADERF_RF_B64"), "serial": decode("BLADERF_SERIAL_B64")}
+    validate_local_profile(profile, node)
+    if ROOT is None and TEST_MODE == "0":
+        validate_fixed_profile(profile, node)
+    with open(manifest_path, "rb") as handle:
+        raw_manifest = handle.read()
+    manifest = json.loads(raw_manifest.decode("utf-8"))
+    validate_manifest(manifest)
+    if raw_manifest != canonical_bytes(manifest) or manifest_sha256(manifest) != pairs["BLADERF_MANIFEST_SHA256"]:
+        fail("generated config manifest binding differs")
+    for artifact in manifest["artifacts"]:
+        if artifact["node"] != node:
+            continue
+        path = rooted("/usr/local/lib/bladerf-link/" + artifact["repo_path"])
+        if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) != artifact["size_bytes"]:
+            fail("installed runtime artifact metadata differs")
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != artifact["sha256"]:
+            fail("installed runtime artifact digest differs")
+    return profile, manifest
+
+
+class Runtime(object):
+    def __init__(self, node, profile):
+        self.node = node
+        self.profile = profile
+        self.network = profile["network"]
+        self.rf = profile["rf"]
+        self.state = "/run/bladerf-link"
+        self.interface = None
+        self.bridge = None
+        self.role = None
+        self.keepalive = None
+        self.hwsim_owned = False
+        self.wpa_stopped = False
+        self.guard_owned = False
+        self.nm_unmanaged = False
+        self.ip_owned = False
+        self.route_owned = False
+        self.management_snapshot = None
+        self.cleaning = False
+        self.before = set()
+        self.logs = []
+        self.fake = False
+        self.incident = False
+
+    def run(self, argv, **kwargs):
+        return subprocess.check_call(argv, **kwargs)
+
+    def output(self, argv):
+        return subprocess.check_output(argv, stderr=subprocess.STDOUT).decode("utf-8", "replace")
+
+    def call(self, argv, **kwargs):
+        return subprocess.call(argv, **kwargs)
+
+    def popen(self, argv, **kwargs):
+        return subprocess.Popen(argv, **kwargs)
+
+    def pause(self, seconds):
+        time.sleep(seconds)
+
+    def module_present(self):
+        return os.path.isdir("/sys/module/mac80211_hwsim")
+
+    def nmcli_available(self):
+        return shutil.which("nmcli") is not None
+
+    def interfaces(self):
+        output = self.output(["iw", "dev"])
+        return {line.split()[1] for line in output.splitlines() if line.strip().startswith("Interface ")}
+
+    def write_status(self, state, clean=False):
+        temporary = os.path.join(self.state, ".%s.status.%d" % (self.node, os.getpid()))
+        with open(temporary, "x") as handle:
+            handle.write("node=%s\nstate=%s\ncleanup_complete=%s\nrf_if=%s\n" %
+                         (self.node, state, str(clean).lower(), self.interface or ""))
+        os.chmod(temporary, 0o640)
+        os.replace(temporary, os.path.join(self.state, self.node + ".status"))
+
+    def wait_for_role_ready(self, role_log, ready_marker, ready_limit):
+        for _unused in range(ready_limit):
+            if self.role.poll() is not None:
+                fail("role process exited during startup", 1)
+            role_log.flush()
+            with open(role_log.name, "r") as handle:
+                if ready_marker in handle.read():
+                    return
+            self.pause(0.1)
+        fail("role readiness timeout", 1)
+
+    def stop_child(self, process):
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+
+    def cleanup(self):
+        if self.cleaning:
+            return True
+        self.cleaning = True
+        if not os.path.isdir(self.state):
+            return True
+        failed = self.incident
+        for process in (self.keepalive, self.role, self.bridge):
+            try:
+                self.stop_child(process)
+            except Exception:
+                failed = True
+        for handle in self.logs:
+            try:
+                handle.close()
+            except Exception:
+                failed = True
+        if self.route_owned and self.interface:
+            if self.call(
+                    ["ip", "route", "del", self.network["peer_ip"], "dev", self.interface],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+                failed = True
+            else:
+                self.route_owned = False
+        if self.ip_owned and self.interface:
+            if self.call(
+                    ["ip", "address", "del", self.network["rf_ip_cidr"], "dev", self.interface],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+                failed = True
+            else:
+                self.ip_owned = False
+        if self.interface:
+            for argv in (["ip", "link", "set", self.interface, "down"],):
+                self.call(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if self.hwsim_owned and self.call(["rmmod", "mac80211_hwsim"]) != 0:
+            failed = True
+            if self.nm_unmanaged and self.interface:
+                self.call(["nmcli", "device", "set", self.interface, "managed", "yes"])
+        if self.wpa_stopped and self.call(["systemctl", "start", "wpa_supplicant.service"]) != 0:
+            failed = True
+        if self.guard_owned:
+            try:
+                self.remove_base_guard()
+            except Exception:
+                failed = True
+        if self.module_present():
+            failed = True
+        self.write_status("FAILED" if failed else "STOPPED", not failed)
+        if not failed:
+            details = os.stat(self.state)
+            if os.path.islink(self.state) or (not self.fake and (details.st_uid, details.st_gid) != (0, 0)):
+                fail("clean runtime state directory ownership changed", 1)
+            shutil.rmtree(self.state)
+        return not failed
+
+    def wait_interface(self):
+        for _unused in range(50):
+            created = self.interfaces() - self.before
+            if len(created) == 1:
+                self.interface = created.pop()
+                return
+            self.pause(0.1)
+        fail("exactly one RF interface was not created", 1)
+
+    def install_base_guard(self):
+        management = self.network["management_if"]
+        self.run(["ip", "link", "show", "dev", management], stdout=subprocess.DEVNULL)
+        self.management_snapshot = stable_management_snapshot(
+            self.output(["ip", "-j", "address", "show", "dev", management]))
+        guard = "/run/NetworkManager/conf.d/90-bladerf-link-base-wlan0.conf"
+        if os.path.lexists(guard) or not os.path.isdir(os.path.dirname(guard)):
+            fail("Base NetworkManager guard boundary is occupied", 1)
+        fd = os.open(guard, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        with os.fdopen(fd, "w") as handle:
+            handle.write("[device-bladerf-link-wlan0]\nmatch-device=interface-name:=wlan0\nmanaged=0\n")
+        self.guard_owned = True
+        self.run(["nmcli", "general", "reload", "conf"])
+        self.run(["ip", "link", "show", "dev", management], stdout=subprocess.DEVNULL)
+        if stable_management_snapshot(self.output(
+                ["ip", "-j", "address", "show", "dev", management])) != self.management_snapshot:
+            fail("Base management interface changed during guard installation", 1)
+
+    def remove_base_guard(self):
+        guard = "/run/NetworkManager/conf.d/90-bladerf-link-base-wlan0.conf"
+        os.unlink(guard)
+        self.run(["nmcli", "general", "reload", "conf"])
+        self.run(["ip", "link", "show", "dev", self.network["management_if"]], stdout=subprocess.DEVNULL)
+        if stable_management_snapshot(self.output(
+                ["ip", "-j", "address", "show", "dev", self.network["management_if"]])) != self.management_snapshot:
+            fail("Base management interface changed during guard removal", 1)
+        self.guard_owned = False
+
+    def execute(self):
+        if not self.fake and (os.geteuid() != 0 or ROOT not in (None, "")):
+            fail("actual runtime requires the real root filesystem", 78)
+        os.makedirs(self.state, mode=0o750, exist_ok=True)
+        details = os.stat(self.state)
+        if os.path.islink(self.state) or (not self.fake and ((details.st_uid, details.st_gid) != (0, 0) or (details.st_mode & 0o777) != 0o750)):
+            fail("runtime state directory is invalid", 1)
+        lock = open(os.path.join(self.state, self.node + ".lock"), "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fail("runtime lock is already held", 1)
+        if self.module_present() or self.call(["ip", "link", "show", "dev", "wlan0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+            fail("pre-existing HWSIM state is not permitted", 1)
+        serial = self.profile["serial"]["bladerf_serial"]
+        if serial not in self.output(["bladeRF-cli", "-p"]):
+            fail("bladeRF serial was not found", 1)
+        self.before = self.interfaces()
+        self.write_status("STARTING")
+        if self.node == "base":
+            self.install_base_guard()
+        rbf = rooted("/usr/local/lib/bladerf-link/firmware/%s/bladerf_wlan.rbf" % self.node)
+        self.run(["bladeRF-cli", "-d", "*:serial=" + serial, "-l", rbf])
+        if self.node == "base":
+            self.run(["modprobe", "mac80211_hwsim", "radios=1", "support_p2p_device=0"])
+        else:
+            if self.call(["systemctl", "is-active", "--quiet", "wpa_supplicant.service"]) == 0:
+                self.run(["systemctl", "stop", "wpa_supplicant.service"])
+                self.wpa_stopped = True
+            self.run(["modprobe", "cfg80211"])
+            self.run(["modprobe", "mac80211"])
+            self.run(["insmod", rooted("/usr/local/lib/bladerf-link/firmware/jetson/mac80211_hwsim.ko"), "radios=1", "support_p2p_device=0"])
+        self.hwsim_owned = True
+        self.wait_interface()
+        if self.node == "base":
+            nm_state = self.output(
+                ["nmcli", "-g", "GENERAL.STATE", "device", "show", self.interface]).strip()
+            if not nm_state.startswith("10"):
+                fail("Base RF interface is not unmanaged-ready", 1)
+        elif self.nmcli_available():
+            self.run(["nmcli", "device", "set", self.interface, "managed", "no"])
+            self.nm_unmanaged = True
+        for argv in (["ip", "link", "set", self.interface, "down"],
+                     ["ip", "link", "set", self.interface, "address", self.network["local_mac"]],
+                     ["ip", "link", "set", self.interface, "up"]):
+            self.run(argv)
+        self.run(["ip", "address", "add", self.network["rf_ip_cidr"], "dev", self.interface])
+        self.ip_owned = True
+        self.run(["ip", "route", "replace", self.network["peer_ip"], "dev", self.interface])
+        self.route_owned = True
+        bridge = rooted("/usr/local/lib/bladerf-link/runtime/%s/bladeRF-linux-mac80211.hwsim42" % self.node)
+        gain = str(self.rf.get("dsa_gain_db", 0))
+        bridge_log = open(os.path.join(self.state, self.node + ".bridge.log"), "x")
+        self.logs.append(bridge_log)
+        bridge_argv = [bridge, "-f", str(self.rf["frequency_mhz"]), "-g", gain, "-V"]
+        if self.node == "base":
+            bridge_argv.append("-H")
+        self.bridge = self.popen(bridge_argv, stdout=bridge_log, stderr=subprocess.STDOUT)
+        self.pause(1)
+        if self.bridge.poll() is not None:
+            fail("bridge exited during startup", 1)
+        if self.node == "jetson":
+            conf = os.path.join(self.state, "jetson-hostapd.conf")
+            with open(conf, "x") as handle:
+                handle.write("interface=%s\ndriver=nl80211\nssid=%s\nhw_mode=g\nchannel=1\nbeacon_int=100\n" % (self.interface, self.network["ssid"]))
+            role_log = open(os.path.join(self.state, "jetson-hostapd.log"), "x")
+            self.logs.append(role_log)
+            self.role = self.popen(["hostapd", "-dd", conf], stdout=role_log, stderr=subprocess.STDOUT)
+            ready_marker = "AP-ENABLED"
+            ready_log = role_log.name
+            ready_limit = JETSON_READY_STEPS
+        else:
+            conf = os.path.join(self.state, "base-wpa.conf")
+            with open(conf, "x") as handle:
+                handle.write('ctrl_interface=%s\nfreq_list=%s\nnetwork={\n ssid="%s"\n bssid=%s\n key_mgmt=NONE\n}\n' %
+                             (os.path.join(self.state, "wpa-control"), self.rf["frequency_mhz"], self.network["ssid"], self.network["peer_mac"]))
+            role_log = open(os.path.join(self.state, "base-wpa.log"), "x")
+            self.logs.append(role_log)
+            self.role = self.popen(["wpa_supplicant", "-dd", "-t", "-Dnl80211", "-i", self.interface, "-c", conf], stdout=role_log, stderr=subprocess.STDOUT)
+            ready_marker = "CTRL-EVENT-CONNECTED"
+            ready_log = role_log.name
+            ready_limit = BASE_ASSOCIATION_READY_STEPS
+        self.wait_for_role_ready(role_log, ready_marker, ready_limit)
+        if self.node == "base":
+            keepalive_log = open(os.path.join(self.state, "base-keepalive.log"), "x")
+            self.logs.append(keepalive_log)
+            self.keepalive = self.popen(
+                ["ping", "-n", "-I", self.interface, "-i", "5", self.network["peer_ip"]],
+                stdout=keepalive_log, stderr=subprocess.STDOUT)
+            self.pause(0.1)
+            if self.keepalive.poll() is not None:
+                fail("Base keepalive exited during startup", 1)
+        self.write_status("READY")
+        if self.fake:
+            return
+        children = [self.bridge, self.role]
+        if self.keepalive is not None:
+            children.append(self.keepalive)
+        while all(process.poll() is None for process in children):
+            self.pause(1)
+        fail("runtime child exited", 1)
+
+
+class FakeProcess(object):
+    def __init__(self, returncode=None):
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = 0
+
+    def kill(self):
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        self.returncode = 0 if self.returncode is None else self.returncode
+        return self.returncode
+
+
+class FakeRuntime(Runtime):
+    def __init__(self, node, profile):
+        Runtime.__init__(self, node, profile)
+        self.fake = True
+        self.state = os.environ.get("BLADERF_LINK_STATE_DIR", "")
+        self.trace_path = os.environ.get("BLADERF_TEST_TRACE", "")
+        self.fail_at = os.environ.get("BLADERF_TEST_FAIL_AT", "")
+        self.loaded = False
+        self.trace_handle = None
+        if self.fail_at not in ("", "bladeRF-cli", "modprobe", "insmod", "hostapd", "wpa_supplicant", "ping", "rmmod", "nmcli", "systemctl"):
+            fail("fake runtime failure point is unsupported")
+        test_root = validate_disposable_test_root()
+        require_contained_path(self.state, test_root, False)
+        if not os.path.isabs(self.trace_path) or os.path.lexists(self.trace_path):
+            fail("fake runtime trace target must be absent and absolute")
+        parent = os.path.dirname(self.trace_path)
+        require_contained_path(parent, test_root, True)
+        self.trace_handle = open(self.trace_path, "x")
+
+    def record(self, operation, argv, inject=True):
+        value = {"operation": operation, "argv": list(argv)}
+        self.trace_handle.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+        self.trace_handle.flush()
+        if inject and self.fail_at and argv and argv[0] == self.fail_at:
+            raise subprocess.CalledProcessError(1, argv)
+
+    def run(self, argv, **kwargs):
+        self.record("run", argv)
+        if argv[0] in ("modprobe", "insmod") and ("mac80211_hwsim" in argv or argv[0] == "insmod"):
+            self.loaded = True
+        return 0
+
+    def call(self, argv, **kwargs):
+        self.record("call", argv, inject=False)
+        if self.fail_at and argv and argv[0] == self.fail_at:
+            return 1
+        if argv[:5] == ["ip", "link", "show", "dev", "wlan0"]:
+            return 1
+        if argv[:3] == ["systemctl", "is-active", "--quiet"]:
+            return 0
+        if argv[:2] == ["rmmod", "mac80211_hwsim"]:
+            self.loaded = False
+        return 0
+
+    def output(self, argv):
+        self.record("output", argv)
+        if argv[:2] == ["bladeRF-cli", "-p"]:
+            return self.profile["serial"]["bladerf_serial"] + "\n"
+        if argv[:3] == ["ip", "-j", "address"]:
+            return '[{"ifname":"%s","operstate":"UP"}]\n' % self.network.get("management_if", "")
+        if argv[:5] == ["nmcli", "-g", "GENERAL.STATE", "device", "show"]:
+            return "10 (unmanaged)\n"
+        return ""
+
+    def interfaces(self):
+        self.record("interfaces", ["iw", "dev"])
+        return {"wlan0"} if self.loaded else set()
+
+    def module_present(self):
+        return self.loaded
+
+    def nmcli_available(self):
+        return True
+
+    def pause(self, seconds):
+        self.record("pause", [str(seconds)])
+
+    def popen(self, argv, **kwargs):
+        self.record("popen", argv, inject=argv[0] != "ping")
+        output = kwargs.get("stdout")
+        if output is not None:
+            if argv[0] == "hostapd":
+                output.write("AP-ENABLED\n")
+            elif argv[0] == "wpa_supplicant":
+                output.write("CTRL-EVENT-CONNECTED\n")
+            output.flush()
+        return FakeProcess(1 if self.fail_at == "ping" and argv[0] == "ping" else None)
+
+    def install_base_guard(self):
+        self.management_snapshot = stable_management_snapshot(self.output(
+            ["ip", "-j", "address", "show", "dev", self.network["management_if"]]))
+        self.record("guard-create", [self.network["management_if"]])
+        self.guard_owned = True
+
+    def remove_base_guard(self):
+        if stable_management_snapshot(self.output(
+                ["ip", "-j", "address", "show", "dev", self.network["management_if"]])) != self.management_snapshot:
+            fail("Base management interface changed during fake guard removal", 1)
+        self.record("guard-remove", [self.network["management_if"]])
+        self.guard_owned = False
+
+    def cleanup(self):
+        try:
+            return Runtime.cleanup(self)
+        finally:
+            if self.trace_handle is not None and not self.trace_handle.closed:
+                self.trace_handle.close()
+
+
+def synthetic(node):
+    test_root = validate_disposable_test_root()
+    state = os.environ.get("BLADERF_LINK_STATE_DIR", "")
+    require_contained_path(state, test_root, True)
+    path = os.path.join(state, node + ".timeline")
+    if os.path.lexists(path):
+        fail("test timeline target must be absent")
+    markers = ["STARTING", "LOAD_RBF", "LOAD_HWSIM_MODPROBE" if node == "base" else "LOAD_HWSIM_INSMOD",
+               "IFACE_READY", "BRIDGE_START", "STA_START" if node == "base" else "AP_START"]
+    if node == "base":
+        markers.append("KEEPALIVE_START")
+    markers.append("CLEANUP_OK")
+    with open(path, "x") as handle:
+        handle.write("\n".join(markers) + "\n")
+
+
+def main():
+    command, node, config_arg = parse_args()
+    if TEST_MODE not in ("0", "1", "2"):
+        fail("unsupported BLADERF_TEST_MODE")
+    if TEST_MODE != "0":
+        if command == "status":
+            fail("test mode is not valid for status")
+        validate_disposable_test_root()
+    authority = read_authority(command)
+    if command == "status":
+        if installed_context(command):
+            read_generated_config(node, config_arg)
+        status(node, authority)
+        return
+    if authority == NO_START:
+        fail("NO_START authority blocks runtime execution", 77)
+    if authority != RESERVED:
+        fail("start authority token is unsupported")
+    profile, manifest = read_generated_config(node, config_arg)
+    if TEST_MODE == "1":
+        synthetic(node)
+        return
+    if TEST_MODE == "2":
+        runtime = FakeRuntime(node, profile)
+        try:
+            runtime.execute()
+        except BaseException:
+            runtime.incident = True
+            runtime.cleanup()
+            raise
+        if not runtime.cleanup():
+            fail("fake runtime cleanup failed", 1)
+        return
+    if manifest["release"]["runtime_state"] != "verified":
+        fail("runtime release state is not verified")
+    runtime = Runtime(node, profile)
+    def stop_signal(_signum, _frame):
+        raise SystemExit(0 if runtime.cleanup() else 1)
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, stop_signal)
+    try:
+        runtime.execute()
+    except BaseException:
+        runtime.incident = True
+        runtime.cleanup()
+        raise
+    if not runtime.cleanup():
+        fail("runtime cleanup failed", 1)
+
+
+if __name__ == "__main__":
+    main()

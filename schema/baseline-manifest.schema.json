@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bladerf-mesh.local/schema/baseline-manifest.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_id", "schema_version", "release", "artifacts", "generated_configs", "provenance"],
+  "$defs": {
+    "safe_repo_path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*(^|/)\\.\\.(/|$)).+$"
+    },
+    "sealed_firmware_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file_type", "uid_gid", "mode"],
+      "properties": {
+        "file_type": {"const": "regular"},
+        "uid_gid": {"const": "0:0"},
+        "mode": {"const": "0444"}
+      }
+    },
+    "source_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file_type", "uid_gid", "mode"],
+      "properties": {
+        "file_type": {"const": "regular"},
+        "uid_gid": {"type": "string", "pattern": "^[0-9]+:[0-9]+$"},
+        "mode": {"type": "string", "pattern": "^0[0-7]{3}$"}
+      }
+    },
+    "artifact_fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node", "artifact_type", "repo_path", "sha256", "size_bytes", "source_snapshot_path", "source_metadata", "build_metadata", "distribution_authority"],
+      "properties": {
+        "node": {"enum": ["base", "jetson"]},
+        "artifact_type": {"enum": ["rbf", "hwsim", "bridge"]},
+        "repo_path": {"$ref": "#/$defs/safe_repo_path"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "size_bytes": {"type": "integer", "minimum": 1},
+        "source_snapshot_path": {"type": "string", "pattern": "^/"},
+        "source_metadata": {"$ref": "#/$defs/source_metadata"},
+        "build_metadata": {"type": "string", "minLength": 1},
+        "distribution_authority": {"type": "string", "minLength": 1}
+      }
+    },
+    "base_rbf_artifact": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact_fields"},
+        {
+          "properties": {
+            "node": {"const": "base"},
+            "artifact_type": {"const": "rbf"},
+            "repo_path": {"const": "firmware/base/bladerf_wlan.rbf"},
+            "sha256": {"const": "cd82e18eb39a7b9832ece316e136a2de64c30cf16ffc53649051695cb215251c"},
+            "size_bytes": {"const": 12858972},
+            "source_snapshot_path": {"const": "/sealed-snapshots/base/bladerf_wlan.rbf"},
+            "build_metadata": {"const": "unknown"},
+            "distribution_authority": {"const": "upstream open-source terms; see THIRD_PARTY_NOTICES.md"},
+            "source_metadata": {"$ref": "#/$defs/sealed_firmware_metadata"}
+          }
+        }
+      ]
+    },
+    "jetson_rbf_artifact": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact_fields"},
+        {
+          "properties": {
+            "node": {"const": "jetson"},
+            "artifact_type": {"const": "rbf"},
+            "repo_path": {"const": "firmware/jetson/bladerf_wlan.rbf"},
+            "sha256": {"const": "c8881ffa7423d98cdd85936322a8870f686d7a23451c68ce735f314c64d19191"},
+            "size_bytes": {"const": 12858972},
+            "source_snapshot_path": {"const": "/sealed-snapshots/jetson/bladerf_wlan.rbf"},
+            "build_metadata": {"const": "unknown"},
+            "distribution_authority": {"const": "upstream open-source terms; see THIRD_PARTY_NOTICES.md"},
+            "source_metadata": {"$ref": "#/$defs/sealed_firmware_metadata"}
+          }
+        }
+      ]
+    },
+    "jetson_hwsim_artifact": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact_fields"},
+        {
+          "properties": {
+            "node": {"const": "jetson"},
+            "artifact_type": {"const": "hwsim"},
+            "repo_path": {"const": "firmware/jetson/mac80211_hwsim.ko"},
+            "sha256": {"const": "dc08504f71ad995aed79ef7c77ce53836a78226a026ba905fa6c6eb0757ccb62"},
+            "size_bytes": {"const": 866976},
+            "source_snapshot_path": {"const": "/sealed-snapshots/jetson/mac80211_hwsim.ko"},
+            "build_metadata": {"const": "vermagic=4.9.337-tegra SMP preempt mod_unload modversions aarch64"},
+            "distribution_authority": {"const": "GPL-2.0-only; see THIRD_PARTY_NOTICES.md"},
+            "source_metadata": {"$ref": "#/$defs/sealed_firmware_metadata"}
+          }
+        }
+      ]
+    },
+    "base_bridge_artifact": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact_fields"},
+        {
+          "properties": {
+            "node": {"const": "base"},
+            "artifact_type": {"const": "bridge"},
+            "repo_path": {"const": "runtime/base/bladeRF-linux-mac80211.hwsim42"},
+            "sha256": {"const": "a2d1be1adff8850b34d5d73dabebb39056419c52375f8e61dbe22d1d8139d5cb"},
+            "size_bytes": {"const": 194640},
+            "source_snapshot_path": {"const": "/sealed-snapshots/base/bladeRF-linux-mac80211.hwsim42"},
+            "build_metadata": {"const": "ELF 64-bit LSB PIE x86-64; compiler=gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"},
+            "distribution_authority": {"const": "GPL-2.0-or-later; see THIRD_PARTY_NOTICES.md"},
+            "source_metadata": {"const": {"file_type": "regular", "uid_gid": "1002:1002", "mode": "0775"}}
+          }
+        }
+      ]
+    },
+    "jetson_bridge_artifact": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact_fields"},
+        {
+          "properties": {
+            "node": {"const": "jetson"},
+            "artifact_type": {"const": "bridge"},
+            "repo_path": {"const": "runtime/jetson/bladeRF-linux-mac80211.hwsim42"},
+            "sha256": {"const": "398ee978ba6f28f861df4163a7aee1b1773e63002135611d7279296217cc77d5"},
+            "size_bytes": {"const": 262560},
+            "source_snapshot_path": {"const": "/sealed-snapshots/jetson/bladeRF-linux-mac80211.hwsim42"},
+            "build_metadata": {"const": "unknown"},
+            "distribution_authority": {"const": "GPL-2.0-or-later; see THIRD_PARTY_NOTICES.md"},
+            "source_metadata": {"const": {"file_type": "regular", "uid_gid": "0:0", "mode": "0755"}}
+          }
+        }
+      ]
+    }
+  },
+  "properties": {
+    "schema_id": {"const": "https://bladerf-mesh.local/schema/baseline-manifest.schema.json"},
+    "schema_version": {"const": 1},
+    "release": {"type": "object", "additionalProperties": false, "required": ["firmware_state", "runtime_state"], "properties": {"firmware_state": {"enum": ["deferred", "verified"]}, "runtime_state": {"enum": ["deferred", "verified"]}}},
+    "artifacts": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": {
+        "oneOf": [
+          {"$ref": "#/$defs/base_rbf_artifact"},
+          {"$ref": "#/$defs/jetson_rbf_artifact"},
+          {"$ref": "#/$defs/jetson_hwsim_artifact"},
+          {"$ref": "#/$defs/base_bridge_artifact"},
+          {"$ref": "#/$defs/jetson_bridge_artifact"}
+        ]
+      },
+      "allOf": [
+        {"contains": {"$ref": "#/$defs/base_rbf_artifact"}},
+        {"contains": {"$ref": "#/$defs/jetson_rbf_artifact"}},
+        {"contains": {"$ref": "#/$defs/jetson_hwsim_artifact"}},
+        {"contains": {"$ref": "#/$defs/base_bridge_artifact"}},
+        {"contains": {"$ref": "#/$defs/jetson_bridge_artifact"}}
+      ]
+    },
+    "generated_configs": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["node", "repo_path", "generator_name", "generator_version"],
+        "properties": {
+          "node": {"enum": ["base", "jetson"]},
+          "repo_path": {"$ref": "#/$defs/safe_repo_path"},
+          "generator_name": {"type": "string", "minLength": 1},
+          "generator_version": {"type": "integer", "minimum": 1}
+        }
+      },
+      "allOf": [
+        {"contains": {"type": "object", "properties": {"node": {"const": "base"}, "repo_path": {"const": "generated/base.env"}, "generator_name": {"const": "baseline_manifest.render_generated_config"}, "generator_version": {"const": 1}}, "required": ["node", "repo_path", "generator_name", "generator_version"]}},
+        {"contains": {"type": "object", "properties": {"node": {"const": "jetson"}, "repo_path": {"const": "generated/jetson.env"}, "generator_name": {"const": "baseline_manifest.render_generated_config"}, "generator_version": {"const": 1}}, "required": ["node", "repo_path", "generator_name", "generator_version"]}}
+      ]
+    },
+    "provenance": {"type": "object", "additionalProperties": false, "required": ["build_metadata"], "properties": {"build_metadata": {"type": "string", "minLength": 1}}}
+  }
+}

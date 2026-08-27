@@ -1,0 +1,1 @@
+{"network":{"local_mac":"02:00:00:00:00:01","management_if":"example-mgmt0","peer_ip":"192.0.2.2","peer_mac":"02:00:00:00:00:02","rf_ip_cidr":"192.0.2.1/30","ssid":"EXAMPLE_NOT_FOR_LIVE"},"node":"base","rf":{"bandwidth_mhz":20,"frequency_mhz":2412,"streams":1},"serial":{"bladerf_serial":"EXAMPLE_BASE_SERIAL"}}

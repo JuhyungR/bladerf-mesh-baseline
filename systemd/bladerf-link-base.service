@@ -1,0 +1,8 @@
+[Unit]
+Description=bladeRF Meshnet Base runtime
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/bladerf-link/base.env
+ExecStart=/usr/local/libexec/bladerf-link-node base /etc/bladerf-link/base.env
+Restart=no

@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly AUTHORITY_NO_START='NO_START'
+readonly AUTHORITY_RESERVED='EXECUTION_RESERVED'
+
+usage() {
+  echo 'usage: bladerf-project-admin {status <base|jetson>|--verify-manifest <path>|reserve-execution <base|jetson>|revoke-execution <base|jetson>|promote-execution <base|jetson>|remove-start-promotion <base|jetson>}' >&2
+  exit 2
+}
+
+require_production_stopped() {
+  local node=$1 service output
+  [[ -z ${BLADERF_ROOT:-} && $(id -u) == 0 ]] || {
+    echo 'production authority mutation requires root on the real filesystem' >&2
+    exit 78
+  }
+  service="bladerf-link-$node.service"
+  output=$(systemctl show "$service" -p UnitFileState -p ActiveState -p SubState -p MainPID -p NRestarts)
+  for expected in UnitFileState=static ActiveState=inactive SubState=dead MainPID=0 NRestarts=0; do
+    grep -qx "$expected" <<<"$output" || {
+      echo "production unit is not stopped-clean: $expected" >&2
+      exit 78
+    }
+  done
+  output=$("$(resolve_runner)" status "$node")
+  for expected in runtime_state=C_BYTES_VALID active=inactive sub=dead main_pid=0 n_restarts=0 wlan0=0 hwsim=absent; do
+    grep -qx "$expected" <<<"$output" || {
+      echo "production runtime is not stopped-clean: $expected" >&2
+      exit 78
+    }
+  done
+  [[ -f /etc/bladerf-link/start-authority && ! -L /etc/bladerf-link/start-authority
+      && $(stat -c '%u:%g' /etc/bladerf-link/start-authority) == 0:0
+      && $(stat -c '%a' /etc/bladerf-link/start-authority) == 444 ]] || {
+    echo 'production authority metadata is invalid' >&2
+    exit 78
+  }
+  [[ ! -e /run/bladerf-link && ! -L /run/bladerf-link ]] || {
+    echo 'production runtime residue is present' >&2
+    exit 78
+  }
+  if [[ $node == base ]]; then
+    [[ ! -e /run/NetworkManager/conf.d/90-bladerf-link-base-wlan0.conf
+        && ! -L /run/NetworkManager/conf.d/90-bladerf-link-base-wlan0.conf ]] || {
+      echo 'production NetworkManager guard residue is present' >&2
+      exit 78
+    }
+  fi
+}
+
+admin_dir=$(cd "$(dirname "$0")" && pwd -P)
+
+resolve_runner() {
+  local runner=
+  for candidate in "$admin_dir/bladerf-link-node" "$admin_dir/../libexec/bladerf-link-node"; do
+    [[ -f $candidate && ! -L $candidate ]] && runner=$candidate && break
+  done
+  [[ -n $runner ]] || {
+    echo 'bladerf-link-node not found beside installed admin runtime' >&2
+    exit 2
+  }
+  printf '%s\n' "$runner"
+}
+
+resolve_manifest_module() {
+  local manifest_module=
+  for candidate in "$admin_dir/../baseline_manifest.py" "$admin_dir/../lib/bladerf-link/baseline_manifest.py"; do
+    [[ -f $candidate && ! -L $candidate ]] && manifest_module=$candidate && break
+  done
+  [[ -n $manifest_module ]] || {
+    echo 'baseline_manifest.py not found beside installed admin runtime' >&2
+    exit 2
+  }
+  printf '%s\n' "$manifest_module"
+}
+
+verify_manifest() {
+  [[ $# == 1 && -f $1 && ! -L $1 ]] || exit 2
+  local manifest_module
+  manifest_module=$(resolve_manifest_module)
+  PYTHONPATH="$(dirname "$manifest_module")${PYTHONPATH:+:$PYTHONPATH}" python3 -c 'import json,sys; from baseline_manifest import canonical_bytes,validate_manifest; raw=open(sys.argv[1],"rb").read(); value=json.loads(raw.decode("utf-8")); validate_manifest(value); assert raw == canonical_bytes(value), "manifest bytes are not canonical"' "$1"
+}
+
+require_test_root() {
+  local root=${BLADERF_ROOT:-}
+  [[ -n $root && $root == /* && $root != / && -d $root && ! -L $root ]] || {
+    echo 'BLADERF_ROOT test root is required for authority mutation' >&2
+    exit 78
+  }
+  [[ $(id -u) != 0 && $(readlink -f -- "$root") == "$root" && $(stat -c '%u' -- "$root") == $(id -u) ]] || {
+    echo 'BLADERF_ROOT must be canonical and owned by a non-root operator' >&2
+    exit 78
+  }
+  printf '%s\n' "$root"
+}
+
+mutate_authority() {
+  local root=$1 expected=$2 token=$3 authority dir tmp
+  authority="${root}/etc/bladerf-link/start-authority"
+  [[ -f $authority && ! -L $authority ]] || {
+    echo 'installed authority is missing or invalid' >&2
+    exit 78
+  }
+  [[ $(cat "$authority") == "$expected" ]] || {
+    echo 'installed authority is not in the required predecessor state' >&2
+    exit 78
+  }
+  dir=$(dirname "$authority")
+  tmp=$(mktemp "${dir}/.start-authority.XXXXXX")
+  if ! printf '%s\n' "$token" >"$tmp" || ! chmod 0444 "$tmp" || ! mv -T -- "$tmp" "$authority"; then
+    rm -f -- "$tmp"
+    exit 78
+  fi
+}
+
+case ${1:-} in
+  status)
+    [[ $# == 2 ]] || usage
+    exec "$(resolve_runner)" status "$2"
+    ;;
+  --verify-manifest)
+    [[ $# == 2 ]] || usage
+    verify_manifest "$2"
+    ;;
+  reserve-execution|revoke-execution)
+    [[ $# == 2 ]] || usage
+    [[ $2 == base || $2 == jetson ]] || usage
+    root=$(require_test_root)
+    if [[ $1 == reserve-execution ]]; then
+      mutate_authority "$root" "$AUTHORITY_NO_START" "$AUTHORITY_RESERVED"
+    else
+      mutate_authority "$root" "$AUTHORITY_RESERVED" "$AUTHORITY_NO_START"
+    fi
+    exec "$root/usr/local/libexec/bladerf-link-node" status "$2"
+    ;;
+  promote-execution|remove-start-promotion)
+    [[ $# == 2 ]] || usage
+    [[ $2 == base || $2 == jetson ]] || usage
+    require_production_stopped "$2"
+    if [[ $1 == promote-execution ]]; then
+      mutate_authority "" "$AUTHORITY_NO_START" "$AUTHORITY_RESERVED"
+    else
+      mutate_authority "" "$AUTHORITY_RESERVED" "$AUTHORITY_NO_START"
+    fi
+    exec "$(resolve_runner)" status "$2"
+    ;;
+  *)
+    usage
+    ;;
+esac

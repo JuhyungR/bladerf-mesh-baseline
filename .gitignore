@@ -1,0 +1,9 @@
+configs/local/*.json
+configs/local/**/*.json
+!configs/local/*.example.json
+__pycache__/
+.pytest_cache/
+.pytest-*/
+artifacts/clean-baseline/live/
+artifacts/clean-baseline/extracted/
+artifacts/clean-baseline/offline/CANDIDATE-BINDING*.json

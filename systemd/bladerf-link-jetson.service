@@ -1,0 +1,8 @@
+[Unit]
+Description=bladeRF Meshnet Jetson runtime
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/bladerf-link/jetson.env
+ExecStart=/usr/local/libexec/bladerf-link-node jetson /etc/bladerf-link/jetson.env
+Restart=no

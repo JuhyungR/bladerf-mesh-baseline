@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() { echo "install-baseline-runtime: $*" >&2; exit 2; }
+tool_dir=$(cd "$(dirname "$0")" && pwd -P)
+repo_root=$(cd "$tool_dir/.." && pwd -P)
+
+if [[ ${1:-} == --verify-manifest-only && $# == 3 && ${2:-} == --manifest ]]; then
+  exec "$tool_dir/bladerf-project-admin" --verify-manifest "$3"
+fi
+
+operation=install
+node=
+manifest=
+profile=
+receipt=
+test_root=
+while (($#)); do
+  case $1 in
+    --verify-only) operation=verify; shift ;;
+    --node|--manifest|--profile|--receipt|--root)
+      (($# >= 2)) || die "missing value for $1"
+      option=$1; value=$2; shift 2
+      case $option in
+        --node) node=$value ;;
+        --manifest) manifest=$value ;;
+        --profile) profile=$value ;;
+        --receipt) receipt=$value ;;
+        --root) test_root=$value ;;
+      esac
+      ;;
+    *) die "unsupported argument: $1" ;;
+  esac
+done
+
+[[ $node == base || $node == jetson ]] || die "node must be base or jetson"
+[[ -n $manifest && -f $manifest && ! -L $manifest ]] || die "manifest must be a regular non-symlink file"
+[[ -n $profile && -f $profile && ! -L $profile ]] || die "profile must be a regular non-symlink file"
+[[ -n $receipt && ! -e $receipt && ! -L $receipt ]] || die "receipt target must be absent"
+run_id=$(basename "$(dirname "$receipt")")
+[[ $run_id =~ ^[A-Za-z0-9._-]+$ ]] || die "receipt parent must be a safe run ID"
+
+root=
+if [[ -n $test_root ]]; then
+  [[ $test_root == /* && $test_root != / ]] || die "--root must be an absolute non-root test path"
+  mkdir -p -- "$test_root"
+  root=$(cd "$test_root" && pwd -P)
+else
+  [[ $(id -u) == 0 ]] || die "installation and verification require root"
+fi
+target() { printf '%s%s' "$root" "$1"; }
+
+"$tool_dir/bladerf-project-admin" --verify-manifest "$manifest"
+runtime_state=$(PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" python3 - "$manifest" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.load(handle)["release"]["runtime_state"])
+PY
+)
+if [[ -z $root && $runtime_state != verified ]]; then die "runtime_state must be verified before a production host install"; fi
+render_dir=$(mktemp -d)
+trap 'rm -rf -- "$render_dir"' EXIT
+rendered="$render_dir/$node.env"
+PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" python3 - "$manifest" "$profile" "$node" "$rendered" <<'PY'
+import json
+import sys
+from baseline_manifest import render_generated_config
+
+manifest_path, profile_path, node, output_path = sys.argv[1:]
+with open(manifest_path, encoding="utf-8") as handle:
+    manifest = json.load(handle)
+with open(profile_path, encoding="utf-8") as handle:
+    profile = json.load(handle)
+with open(output_path, "wb") as handle:
+    handle.write(render_generated_config(manifest, profile, node))
+PY
+
+os_id=test
+os_version=test
+architecture=$(uname -m)
+kernel=$(uname -r)
+pid1=test
+if [[ -z $root ]]; then
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  os_id=${ID:-}
+  os_version=${VERSION_ID:-}
+  pid1=$(ps -p 1 -o comm= | tr -d '[:space:]')
+  [[ $os_id == ubuntu && $pid1 == systemd ]] || die "unsupported OS or PID 1"
+  if [[ $node == base ]]; then
+    [[ $os_version == 24.04 && $architecture == x86_64 && $kernel == 6.8.0-136-generic ]] || die "Base requires Ubuntu 24.04 x86_64 kernel 6.8.0-136-generic"
+  else
+    [[ $os_version == 18.04 && $architecture == aarch64 && $kernel == 4.9.337-tegra ]] || die "Jetson requires Ubuntu 18.04 aarch64 kernel 4.9.337-tegra"
+  fi
+  required_commands=(python3 systemctl ip iw bladeRF-cli modprobe rmmod)
+  if [[ $node == base ]]; then
+    required_commands+=(nmcli wpa_supplicant ping)
+  else
+    required_commands+=(hostapd insmod)
+  fi
+  missing_commands=()
+  for required_command in "${required_commands[@]}"; do
+    command -v "$required_command" >/dev/null 2>&1 || missing_commands+=("$required_command")
+  done
+  ((${#missing_commands[@]} == 0)) || die "missing runtime commands: ${missing_commands[*]}"
+fi
+
+runner=$(target /usr/local/libexec/bladerf-link-node)
+admin=$(target /usr/local/sbin/bladerf-project-admin)
+module=$(target /usr/local/lib/bladerf-link/baseline_manifest.py)
+installed_manifest=$(target /usr/local/share/bladerf-mesh/manifest/baseline-manifest.json)
+authority=$(target /etc/bladerf-link/start-authority)
+config=$(target "/etc/bladerf-link/$node.env")
+unit=$(target "/etc/systemd/system/bladerf-link-$node.service")
+firmware_dir=$(target "/usr/local/lib/bladerf-link/firmware/$node")
+runtime_dir=$(target "/usr/local/lib/bladerf-link/runtime/$node")
+bridge="$runtime_dir/bladeRF-linux-mac80211.hwsim42"
+
+if [[ $operation == install ]]; then
+  install_targets=("$runner" "$admin" "$module" "$installed_manifest" "$authority" "$config" "$unit" "$firmware_dir/bladerf_wlan.rbf" "$bridge")
+  [[ $node == base ]] || install_targets+=("$firmware_dir/mac80211_hwsim.ko")
+  for path in "${install_targets[@]}"; do [[ ! -e $path && ! -L $path ]] || die "install target already exists: $path"; done
+  install -d -m 0755 -- "$(dirname "$runner")" "$(dirname "$admin")" "$(dirname "$module")" "$(dirname "$installed_manifest")" "$firmware_dir" "$runtime_dir" "$(dirname "$unit")"
+  install -d -m 0750 -- "$(dirname "$config")"
+  install -m 0755 -- "$tool_dir/bladerf-link-node" "$runner"
+  install -m 0755 -- "$tool_dir/bladerf-project-admin" "$admin"
+  install -m 0444 -- "$repo_root/baseline_manifest.py" "$module"
+  install -m 0444 -- "$manifest" "$installed_manifest"
+  install -m 0444 -- "$repo_root/firmware/$node/bladerf_wlan.rbf" "$firmware_dir/bladerf_wlan.rbf"
+  install -m 0555 -- "$repo_root/runtime/$node/bladeRF-linux-mac80211.hwsim42" "$bridge"
+  if [[ $node == jetson ]]; then install -m 0444 -- "$repo_root/firmware/jetson/mac80211_hwsim.ko" "$firmware_dir/mac80211_hwsim.ko"; fi
+  printf 'NO_START\n' | install -m 0444 /dev/stdin "$authority"
+  install -m 0440 -- "$rendered" "$config"
+  install -m 0644 -- "$repo_root/systemd/bladerf-link-$node.service" "$unit"
+  if [[ -z $root ]]; then systemctl daemon-reload; fi
+fi
+
+PYTHONPATH= "$admin" --verify-manifest "$installed_manifest"
+cmp -s -- "$tool_dir/bladerf-link-node" "$runner" || die "runner differs"
+cmp -s -- "$tool_dir/bladerf-project-admin" "$admin" || die "admin differs"
+cmp -s -- "$repo_root/baseline_manifest.py" "$module" || die "installed manifest module differs"
+cmp -s -- "$manifest" "$installed_manifest" || die "installed manifest differs"
+cmp -s -- "$rendered" "$config" || die "generated config differs"
+cmp -s -- "$repo_root/systemd/bladerf-link-$node.service" "$unit" || die "unit differs"
+[[ $(cat "$authority") == NO_START ]] || die "NO_START authority differs"
+[[ $(stat -c '%a' "$runner") == 755 && $(stat -c '%a' "$admin") == 755 ]] || die "runtime executable mode differs"
+[[ $(stat -c '%a' "$bridge") == 555 ]] || die "bridge executable mode differs"
+[[ $(stat -c '%a' "$module") == 444 && $(stat -c '%a' "$installed_manifest") == 444 ]] || die "manifest runtime mode differs"
+[[ $(stat -c '%a' "$authority") == 444 && $(stat -c '%a' "$config") == 440 && $(stat -c '%a' "$unit") == 644 ]] || die "authority, config, or unit mode differs"
+if [[ -z $root ]]; then
+  for path in "$runner" "$admin" "$module" "$installed_manifest" "$authority" "$config" "$unit" "$firmware_dir/bladerf_wlan.rbf" "$bridge"; do [[ $(stat -c '%u:%g' "$path") == 0:0 ]] || die "installed file is not root-owned: $path"; done
+  [[ $node == base ]] || [[ $(stat -c '%u:%g' "$firmware_dir/mac80211_hwsim.ko") == 0:0 ]] || die "installed HWSIM is not root-owned"
+fi
+
+artifact_root=${root:-/}
+is_test_root=false
+[[ -z $root ]] || is_test_root=true
+PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" python3 - "$manifest" "$node" "$artifact_root" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+manifest_path, node, root = sys.argv[1:]
+with open(manifest_path, encoding="utf-8") as handle:
+    manifest = json.load(handle)
+for artifact in manifest["artifacts"]:
+    if artifact["node"] != node:
+        continue
+    prefix, relative = artifact["repo_path"].split("/", 1)
+    path = os.path.join(root, "usr/local/lib/bladerf-link", prefix, relative)
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise SystemExit("installed artifact is missing or a symlink: " + prefix + "/" + relative)
+    if os.path.getsize(path) != artifact["size_bytes"]:
+        raise SystemExit("installed artifact size differs: " + prefix + "/" + relative)
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    if digest.hexdigest() != artifact["sha256"]:
+        raise SystemExit("installed artifact digest differs: " + prefix + "/" + relative)
+PY
+
+service="bladerf-link-$node.service"
+unit_state=static
+active_state=inactive
+sub_state=dead
+main_pid=0
+nrestarts=0
+if [[ -z $root ]]; then
+  unit_state=$(systemctl show "$service" -p UnitFileState --value)
+  active_state=$(systemctl show "$service" -p ActiveState --value)
+  sub_state=$(systemctl show "$service" -p SubState --value)
+  main_pid=$(systemctl show "$service" -p MainPID --value)
+  nrestarts=$(systemctl show "$service" -p NRestarts --value)
+fi
+[[ $unit_state == static && $active_state == inactive && $sub_state == dead && $main_pid == 0 && $nrestarts == 0 ]] || die "systemd state is not safe"
+run_dir=$(target /run)
+if [[ -d $run_dir ]] && find "$run_dir" -maxdepth 1 -name 'bladerf-link*' -print -quit | grep -q .; then die "runtime lock or residue exists"; fi
+sudoers_dir=$(target /etc/sudoers.d)
+if [[ -d $sudoers_dir ]] && find "$sudoers_dir" -maxdepth 1 -name 'bladerf-project*' -print -quit | grep -q .; then die "project sudo authority already exists"; fi
+status_output=$(BLADERF_ROOT="$root" "$runner" status "$node")
+grep -qx 'inventory_version=g148-immutable-runtime-v1' <<<"$status_output" || die "inventory version invalid"
+grep -qx 'runtime_state=C_BYTES_VALID' <<<"$status_output" || die "runtime bytes invalid"
+grep -qx 'start_authority=NO_START' <<<"$status_output" || die "start authority invalid"
+grep -qx 'active=inactive' <<<"$status_output" || die "active state invalid"
+grep -qx 'sub=dead' <<<"$status_output" || die "sub state invalid"
+grep -qx 'main_pid=0' <<<"$status_output" || die "main pid invalid"
+grep -qx 'n_restarts=0' <<<"$status_output" || die "restart count invalid"
+
+candidate_commit=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || printf unknown)
+mkdir -p -- "$(dirname "$receipt")"
+PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" python3 - "$receipt" "$operation" "$node" "$manifest" "$candidate_commit" "$os_id" "$os_version" "$architecture" "$kernel" "$pid1" "$unit_state" "$active_state" "$sub_state" "$main_pid" "$nrestarts" "$artifact_root" "$is_test_root" "$run_id" "$runtime_state" <<'PY'
+import datetime
+import json
+import os
+import stat
+import sys
+from baseline_manifest import canonical_bytes, manifest_sha256
+
+(receipt, operation, node, manifest_path, candidate, os_id, os_version, architecture,
+ kernel, pid1, unit_state, active_state, sub_state, main_pid, nrestarts, root,
+ is_test_root, run_id, runtime_state) = sys.argv[1:]
+with open(manifest_path, encoding="utf-8") as handle:
+    manifest = json.load(handle)
+installed = []
+for artifact in manifest["artifacts"]:
+    if artifact["node"] != node:
+        continue
+    prefix, relative = artifact["repo_path"].split("/", 1)
+    path = os.path.join(root, "usr/local/lib/bladerf-link", prefix, relative)
+    details = os.stat(path)
+    installed.append({"artifact_type": artifact["artifact_type"], "installed_path": "/usr/local/lib/bladerf-link/" + prefix + "/" + relative, "mode": format(stat.S_IMODE(details.st_mode), "04o"), "sha256": artifact["sha256"], "size_bytes": artifact["size_bytes"], "uid_gid": "%d:%d" % (details.st_uid, details.st_gid)})
+value = {
+    "schema_version": 1, "status": "pass", "operation": operation, "node": node, "run_id": run_id,
+    "created_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+    "candidate_commit": candidate, "manifest_sha256": manifest_sha256(manifest), "runtime_state": runtime_state,
+    "environment": {"os_id": os_id, "os_version": os_version, "architecture": architecture, "kernel": kernel, "pid1": pid1},
+    "profile_schema_valid": True,
+    "unit": {"unit_file_state": unit_state, "active_state": active_state, "sub_state": sub_state, "main_pid": int(main_pid), "nrestarts": int(nrestarts)},
+    "authority": {"start_policy": "NO_START", "project_sudoers_installed": False, "start_vector_installed": False, "restart_vector_installed": False, "systemctl_vector_installed": False, "shell_vector_installed": False},
+    "artifacts": installed, "c_bytes_state": "C_BYTES_VALID", "start_policy": "NO_START", "stopped_clean": True,
+    "lock_free": True, "temp_residue_present": False,
+    "rf_started": False, "installer_rf_started": False, "production_mutation": False,
+    "test_root": is_test_root == "true",
+}
+with open(receipt, "xb") as handle:
+    handle.write(canonical_bytes(value))
+PY
+
+printf 'install_status=%s\nnode=%s\nmanifest_sha256=' "$operation" "$node"
+PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" python3 - "$manifest" <<'PY'
+import json
+import sys
+from baseline_manifest import manifest_sha256
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(manifest_sha256(json.load(handle)))
+PY

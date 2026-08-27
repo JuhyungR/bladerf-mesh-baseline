@@ -1,0 +1,1 @@
+{"network":{"local_mac":"02:00:00:00:00:02","peer_ip":"192.0.2.1","peer_mac":"02:00:00:00:00:01","rf_ip_cidr":"192.0.2.2/30","ssid":"EXAMPLE_NOT_FOR_LIVE"},"node":"jetson","rf":{"bandwidth_mhz":20,"dsa_gain_db":0,"frequency_mhz":2412,"streams":1},"serial":{"bladerf_serial":"EXAMPLE_JETSON_SERIAL"}}
